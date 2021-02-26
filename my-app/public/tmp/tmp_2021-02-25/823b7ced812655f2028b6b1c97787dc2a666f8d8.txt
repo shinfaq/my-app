@@ -1,0 +1,532 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Carbon\CarbonPeriod;
+use Carbon\Carbon;
+use App\Models\TSale;
+use App\Models\User;
+use App\Models\MShop;
+use App\Models\MSkill;
+use App\Models\MCustomer;
+use App\Models\MCourse;
+use App\Models\MItem;
+use App\Models\TContractDetail;
+use App\Models\TContract;
+use App\Models\MTaxe;
+use App\Service\SaleTrendExportByMonth;
+use App\Service\SaleTrendExportByDay;
+use Excel;
+use Auth;
+use DB;
+
+class SalesTrendController extends Controller
+{
+    public function salesTrendByYear($shop_id, Request $request, $time)
+    {
+        $sale = TSale::where('shop_id', $shop_id)->with('m_customers', 'TReservation' , 'TContractDetail.contract.course.tax');
+        if ($request->target_type == 0) {
+            $sale = $sale->whereHas('TReservation', function ($query) use ($shop_id, $request, $time) {
+                return $query->where('shop_id', $shop_id)
+                ->where("staff_id", $request->staff_id)
+                ->whereYear('reservation_time', $time);
+            })->whereHas('details')->with(['details'=>function ($query) use ( $request) {
+                $query=$query->groupBy('sale_id','amount');
+                return $query->select(['sale_id','amount', 'category_cd', DB::raw("SUM((money-discount)*amount) as total_money")])
+                    ->groupBy('category_cd');
+            },'TReservation']);
+            $result = $sale->get()->groupBy(function ($val) {
+                return Carbon::parse($val->TReservation->reservation_time)->format('m');
+            });
+        }
+        if ($request->target_type == 1) {
+            $sale = $sale->whereHas('TReservation', function ($query) use ($shop_id, $request, $time) {
+                return $query->where('shop_id', $shop_id)
+                ->where("staff_id", $request->staff_id)
+                ->whereMonth("reservation_time", $request->target_month)
+                ->whereYear('reservation_time', $time);
+            })->whereHas('details')
+            ->with(['details'=>function ($query) use ($request) {
+                $query=$query->groupBy('sale_id','amount');
+                return $query->select(['sale_id','amount', 'category_cd', DB::raw("SUM((money-discount)*amount) as total_money")])
+                    ->groupBy('category_cd');
+            },'TReservation']);
+            $result = $sale->get()->groupBy(function ($val) {
+                return Carbon::parse($val->TReservation->reservation_time)->format('d');
+            });
+        }
+        $result = json_decode(json_encode($result), true);
+        $result_key = array_keys($result);
+        $customer_arr = array();
+        for ($i=0; $i < count($result_key); $i++) {
+            $total_money = 0;
+            $total_category_cd01 = 0;
+            $total_category_cd02 = 0;
+            $total_category_cd03 = 0;
+            $total_customer = 0;
+            $total_amount02 = 0;
+            $colum = count($result["$result_key[$i]"]);
+            $customer_arr = [];
+            $key_customer = [];
+            $total_contract=0;
+            $total_customer_contract=[];
+            foreach ($result["$result_key[$i]"] as $value) {
+                if(count($value["t_contract_detail"])<1)
+                {
+                    $total_contract+=0;
+                }
+                else{
+                    $total_contract_details = 0;
+                    array_push($total_customer_contract, $value["customer_id"]);
+                    foreach ($value["t_contract_detail"] as $contract_details) {
+                        $total_contract_details +=  ($contract_details["contract"]["course"]["price"]/$contract_details["contract"]["course"]["count"])*
+                                (1+ $contract_details["contract"]["course"]["tax"]["tax"]/100);
+
+                    }
+                    $total_contract+=$total_contract_details;
+                }
+
+                array_push($customer_arr, $value["customer_id"]);
+
+                foreach ($value["details"] as $detail) {
+                    if ($detail["category_cd"] == 01) {
+                        $total_category_cd01 += (int)$detail["total_money"];
+                    }
+                    if ($detail["category_cd"] == 02) {
+                        $total_category_cd02 += (int)$detail["total_money"];
+                        $total_amount02 += (int)$detail["amount"];
+                    }
+                    if ($detail["category_cd"] == 03) {
+                        $total_category_cd03 += (int)$detail["total_money"];
+                    }
+                }
+            }
+            $total_customer_details = array_count_values($customer_arr);
+            if(count($total_customer_contract)<1)
+                     $result["$result_key[$i]"]["total_customer_contract"] = 0;
+            else{
+                $result["$result_key[$i]"]["total_customer_contract"] =  array_count_values($total_customer_contract);
+            }
+            $result["$result_key[$i]"]["total_contract"] = $total_contract;
+            $result["$result_key[$i]"]["total_category_cd01"] = $total_category_cd01;
+            $result["$result_key[$i]"]["total_category_cd02"] = $total_category_cd02;
+            $result["$result_key[$i]"]["total_category_cd03"] = $total_category_cd03;
+            $result["$result_key[$i]"]["total_customer_details"] = $total_customer_details;
+            $result["$result_key[$i]"]["total_money"] = $total_category_cd01 + $total_category_cd02 + $total_category_cd03 + $total_contract;
+            $result["$result_key[$i]"]["amount02"] = $total_amount02;
+            $result["$result_key[$i]"]["avg"] = $result["$result_key[$i]"]["total_money"]/count($total_customer_details);
+            foreach ($total_customer_details as $value) {
+                $total_customer += $value;
+            }
+        }
+        return $result;
+    }
+
+    public function addValue($shop_id, $request, $time)
+    {
+        $now = json_decode(json_encode($this->salesTrendByYear($shop_id, $request, $time)),1);ksort($now);
+        $keys = array_keys($now);
+        $list = $this->createMonthOrDay($shop_id, $request, $time);
+        for ($i=0;$i<count($keys);$i++) {
+            $list[(int)$keys[$i]-1] = $now[$keys[$i]];
+        }
+        return $list;
+    }
+
+    public function createMonthOrDay($shop_id, $request, $time)
+    {
+        $year = (int)$time->format('Y');
+        $month = (int)$time->format('m');
+        $list = array();
+        $i = 1;
+        if ($request->target_type == 0) {
+            while ($i <= $month) {
+                $temp = $i++;
+                $covert = Carbon::parse("$year"."-"."$temp")->format('Y-m');
+                $covert = str_replace('-', '年', "$covert") . "月";
+                array_push($list, $covert);
+            }
+        }
+        if ($request->target_type == 1) {
+            $month = (int)$request->target_month;
+            $day = Carbon::parse("$year"."-"."$month"."-"."01");
+            $end_day = (int)$day->endOfMonth()->format('d');
+            while ($i <= $end_day) {
+                $temp = $i++;
+                $rs = ("$year"."/"."$month"."/".$temp);
+                $weekMap = [
+                    0 => '日',
+                    1 => '月',
+                    2 => '火',
+                    3 => '水',
+                    4 => '木',
+                    5 => '金',
+                    6 => '土',
+                ];
+                $parse_rs = Carbon::parse($rs)->dayOfWeek;
+                $result = Carbon::parse($rs)->format('Y/m/d')." "."($weekMap[$parse_rs])";
+                array_push($list, $result);
+            }
+        }
+        return $list;
+    }
+
+    public function exportView($shop_id, Request $request)
+    {
+        $now_year = Carbon::now();
+        $last_year = Carbon::parse(date('Y-m-d', strtotime(Carbon::now()->endOfYear(). "- 1 years")));
+        $now = json_decode(json_encode($this->addValue($shop_id, $request, $now_year)),1);
+        return $now;
+        foreach ($now as $sale) {
+            $listMember = 0;
+            $list = [];
+            $listNotMember = 0;
+            $totalMoneyItemOfMember = 0 ;
+            $totalMoneyItemOfNotMember = 0;
+            $totalMoneySkillOfMember = 0;
+            $totalMoneySkillOfNotMember = 0;
+            $totalMoneyCourseOfMember =0;
+            $totalMoneyCourseOfNotMember = 0;
+            $memberOfItem = [];
+            $notMemberOfItem = [];
+            $memberOfCourse = [];
+            $notMemberOfCourse = [];
+            $memberOfSkill = [];
+            $notMemberOfSkill = [];
+            $customer_new_skill = [];
+            for ($i=0; $i < count($sale) - 9; $i++) {
+                if (!in_array($sale[$i]["customer_id"], $customer_new_skill)) {
+                    array_push($customer_new_skill, $sale[$i]["customer_id"]);
+                }
+                if ($this->checkExist($sale[$i]['customer_id'], $list)==false) {
+                    array_push($list, $sale[$i]['customer_id']);
+                    if ($this->checkMember($sale[$i]['m_customers'])) {
+                        $listMember++;
+                    } else {
+                        $listNotMember++;
+                    }
+                }
+                for ($l=0; $l < count($sale[$i]['details']); $l++) {
+                    if ($sale[$i]['details'][$l]['category_cd']=='01') {
+                        if ($sale[$i]['m_customers']['member_flg']) {
+                            if ($this->checkExist($sale[$i]['customer_id'], $memberOfSkill)==false) {
+                                array_push($memberOfSkill, $sale[$i]['customer_id']);
+                            }
+                            $totalMoneySkillOfMember += $sale[$i]['details'][$l]['total_money'];
+                        } else {
+                            if ($this->checkExist($sale[$i]['customer_id'], $notMemberOfSkill)==false) {
+                                array_push($notMemberOfSkill, $sale[$i]['customer_id']);
+                            }
+                            $totalMoneySkillOfNotMember += $sale[$i]['details'][$l]['total_money'];
+                        }
+                    } else {
+                        if ($sale[$i]['details'][$l]['category_cd']=='02') {
+                            if ($sale[$i]['m_customers']['member_flg']) {
+                                if ($this->checkExist($sale[$i]['customer_id'], $memberOfCourse)==false) {
+                                    array_push($memberOfCourse, $sale[$i]['customer_id']);
+                                }
+                                $totalMoneyCourseOfMember += $sale[$i]['details'][$l]['total_money'];
+                            } else {
+                                if ($this->checkExist($sale[$i]['customer_id'], $notMemberOfCourse)==false) {
+                                    array_push($notMemberOfCourse, $sale[$i]['customer_id']);
+                                }
+                                $totalMoneySkillOfNotMember += $sale[$i]['details'][$l]['total_money'];
+                            }
+                        } else {
+                            if ($sale[$i]['details'][$l]['category_cd']=='03') {
+                                if ($sale[$i]['m_customers']['member_flg']) {
+                                    if ($this->checkExist($sale[$i]['customer_id'], $memberOfItem)==false) {
+                                        array_push($memberOfItem, $sale[$i]['customer_id']);
+                                    }
+                                    $totalMoneyItemOfMember += $sale[$i]['details'][$l]['total_money'];
+                                } else {
+                                    if ($this->checkExist($sale[$i]['customer_id'], $notMemberOfItem)==false) {
+                                        array_push($notMemberOfItem, $sale[$i]['customer_id']);
+                                    }
+                                    $totalMoneyItemOfNotMember += $sale[$i]['details'][$l]['total_money'];
+                                }
+                            }
+                        }
+                    }
+                    $key['notMemberOfSkill']=count($notMemberOfSkill);
+                    $key['notMemberOfCourse']=count($notMemberOfCourse);
+                    $key['notMemberOfItem']=count($notMemberOfItem);
+                    $key['memberOfSkill']=count($memberOfSkill);
+                    $key['memberOfCourse']=count($memberOfCourse);
+                    $key['memberOfItem']=count($memberOfItem);
+                    $key['listMember']= $listMember;
+                    $key['listNotMember']= $listNotMember;
+                    $key['totalMoneyItemOfMember']= $totalMoneyItemOfMember;
+                    $key['totalMoneyItemOfNotMember']=$totalMoneyItemOfNotMember;
+                    $key['totalMoneySkillOfMember']=$totalMoneySkillOfMember;
+                    $key['totalMoneySkillOfNotMember']=$totalMoneySkillOfNotMember;
+                    $key['totalMoneyCourseOfMember']=$totalMoneyCourseOfMember;
+                    $key['totalMoneyCourseOfNotMember']= $totalMoneyCourseOfNotMember;
+                    $listData[]= $key;
+                }
+            }
+        }
+        return $customer_new_skill;
+
+        // return [
+        //     "now_year" => json_decode(json_encode($this->addValue($shop_id, $request, $now_year)),1),
+        //     "last_year" => json_decode(json_encode($this->addValue($shop_id, $request, $last_year)),1)
+        // ];
+    }
+
+    public function resultView($shop_id, Request $request, $year, $time)
+    {
+        $result = $this->getSalesTrend($shop_id, $request);
+        if ($result[$year] == null) {
+            return null;
+        }
+        $keys = array_keys($result[$year]);
+
+        $listData;
+        foreach ($result[$year] as $key) {
+            $listMember = 0;
+            $list = [];
+            $listNotMember = 0;
+            $totalMoneyItemOfMember = 0 ;
+            $totalMoneyItemOfNotMember = 0;
+            $totalMoneySkillOfMember = 0;
+            $totalMoneySkillOfNotMember = 0;
+            $totalMoneyCourseOfMember =0;
+            $totalMoneyCourseOfNotMember = 0;
+            $memberOfItem = [];
+            $notMemberOfItem = [];
+            $memberOfCourse = [];
+            $notMemberOfCourse = [];
+            $memberOfSkill = [];
+            $notMemberOfSkill = [];
+            for ($j=0; $j < count($key) - 9; $j++) {
+                if ($this->checkExist($key[$j]['customer_id'], $list)==false) {
+                    array_push($list, $key[$j]['customer_id']);
+                    if ($this->checkMember($key[$j]['m_customers'])) {
+                        $listMember++;
+                    } else {
+                        $listNotMember++;
+                    }
+                }
+                for ($l=0; $l < count($key[$j]['details']); $l++) {
+                    if ($key[$j]['details'][$l]['category_cd']=='01') {
+                        if ($key[$j]['m_customers']['member_flg']) {
+                            if ($this->checkExist($key[$j]['customer_id'], $memberOfSkill)==false) {
+                                array_push($memberOfSkill, $key[$j]['customer_id']);
+                            }
+                            $totalMoneySkillOfMember += $key[$j]['details'][$l]['total_money'];
+                        } else {
+                            if ($this->checkExist($key[$j]['customer_id'], $notMemberOfSkill)==false) {
+                                array_push($notMemberOfSkill, $key[$j]['customer_id']);
+                            }
+                            $totalMoneySkillOfNotMember += $key[$j]['details'][$l]['total_money'];
+                        }
+                    } else {
+                        if ($key[$j]['details'][$l]['category_cd']=='02') {
+                            if ($key[$j]['m_customers']['member_flg']) {
+                                if ($this->checkExist($key[$j]['customer_id'], $memberOfCourse)==false) {
+                                    array_push($memberOfCourse, $key[$j]['customer_id']);
+                                }
+                                $totalMoneyCourseOfMember += $key[$j]['details'][$l]['total_money'];
+                            } else {
+                                if ($this->checkExist($key[$j]['customer_id'], $notMemberOfCourse)==false) {
+                                    array_push($notMemberOfCourse, $key[$j]['customer_id']);
+                                }
+                                $totalMoneySkillOfNotMember += $key[$j]['details'][$l]['total_money'];
+                            }
+                        } else {
+                            if ($key[$j]['details'][$l]['category_cd']=='03') {
+                                if ($key[$j]['m_customers']['member_flg']) {
+                                    if ($this->checkExist($key[$j]['customer_id'], $memberOfItem)==false) {
+                                        array_push($memberOfItem, $key[$j]['customer_id']);
+                                    }
+                                    $totalMoneyItemOfMember += $key[$j]['details'][$l]['total_money'];
+                                } else {
+                                    if ($this->checkExist($key[$j]['customer_id'], $notMemberOfItem)==false) {
+                                        array_push($notMemberOfItem, $key[$j]['customer_id']);
+                                    }
+                                    $totalMoneyItemOfNotMember += $key[$j]['details'][$l]['total_money'];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            $key['notMemberOfSkill']=count($notMemberOfSkill);
+            $key['notMemberOfCourse']=count($notMemberOfCourse);
+            $key['notMemberOfItem']=count($notMemberOfItem);
+            $key['memberOfSkill']=count($memberOfSkill);
+            $key['memberOfCourse']=count($memberOfCourse);
+            $key['memberOfItem']=count($memberOfItem);
+            $key['listMember']= $listMember;
+            $key['listNotMember']= $listNotMember;
+            $key['totalMoneyItemOfMember']= $totalMoneyItemOfMember;
+            $key['totalMoneyItemOfNotMember']=$totalMoneyItemOfNotMember;
+            $key['totalMoneySkillOfMember']=$totalMoneySkillOfMember;
+            $key['totalMoneySkillOfNotMember']=$totalMoneySkillOfNotMember;
+            $key['totalMoneyCourseOfMember']=$totalMoneyCourseOfMember;
+            $key['totalMoneyCourseOfNotMember']= $totalMoneyCourseOfNotMember;
+            $listData[]= $key;
+        }
+
+        $listMonth = $this->createMonthOrDay($shop_id, $request, $time);
+
+        for ($i=0;$i<count($keys);$i++) {
+            $listMonth[(int)$keys[$i]-1] = $listData[$i];
+        }
+        return $listMonth;
+    }
+
+    public function checkExist($id, $list)
+    {
+        for ($i=0;$i<count($list);$i++) {
+            if ($list[$i]==$id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public function checkMember($customer)
+    {
+        if ($customer['member_flg']) {
+            return true;
+        }
+        return false;
+    }
+
+    public function view_day($shop_id, Request $request)
+    {
+        $now = Carbon::now()->format('Y');
+        $sale = TSale::where('shop_id', $shop_id)->with('m_customers', 'TReservation', 'TContractDetail.contract.course.tax');
+
+        $sale = $sale->whereHas('TReservation', function ($query) use ($shop_id, $request, $now) {
+            $target_month = date('m', strtotime($now.'-'.$request->target_month));
+            return $query->where('shop_id', $shop_id)
+            ->where("staff_id", $request->staff_id)
+            ->whereMonth("reservation_time", $target_month)
+            ->whereYear('reservation_time', "$now");
+        })->whereHas('details')
+        ->with(['details', 'TReservation.details']);
+
+        $listResult = $sale->get()->groupBy(function ($val) {
+            return Carbon::parse($val->TReservation->reservation_time)->format('d');
+        });
+        $listResult = json_decode(json_encode($listResult), true);
+        //sort and convert
+        ksort($listResult);
+        $keys = array_keys($listResult);
+        for ($i=0; $i < count($keys); $i++) {
+            $keys[$i] = (string)$keys[$i];
+        }
+        // return $listResult;
+        for ($i=0; $i < count($keys); $i++) {
+            $customer_new_skill = [];
+            $customer_new_contract_course = [];
+            $customer_course_digestion = [];
+            $total_new_skill = 0;
+            $total_new_contract_course = 0;
+            $total_amount_course_digestion = 0;
+            $item_only = 0;
+            $nomination_skill = 0; //pt
+            $in_charge_of_treatment = 0;
+            $sum_discount = 0;
+
+            for ($j=0; $j < count($listResult[$keys[$i]]); $j++) {
+                for ($k=0; $k < count($listResult[$keys[$i]][$j]["details"]); $k++) {
+                    $sum_discount += $listResult[$keys[$i]][$j]["details"][$k]["discount"];
+                    if ($listResult[$keys[$i]][$j]["details"][$k]["category_cd"] == "01") {
+                        $skill = MSkill::find($listResult[$keys[$i]][$j]["details"][$k]["menu_id"])
+                        ->whereYear('created_at', $now)
+                        ->whereMonth('created_at', $request->target_month)->get();
+                        if (count($skill) > 0) {
+                            $total_new_skill += ($listResult[$keys[$i]][$j]["details"][$k]["money"] - $listResult[$keys[$i]][$j]["details"][$k]["discount"]) * $listResult[$keys[$i]][$j]["details"][$k]["amount"];
+                        }
+                        //施術担当
+                        foreach ($listResult[$keys[$i]][$j]["t_reservation"]["details"] as $reservation_details) {
+                            if ($reservation_details["category_cd"] == "01") {
+                                if ($reservation_details["staff_id"] == $request->staff_id) {
+                                    $nomination_skill += $listResult[$keys[$i]][$j]["details"][$k]["money"] - $listResult[$keys[$i]][$j]["details"][$k]["discount"];
+                                }
+                            }
+                        }
+                    } elseif (count($listResult[$keys[$i]][$j]["t_contract_detail"]) > 0) {
+                        if ($listResult[$keys[$i]][$j]["details"][$k]["category_cd"] == "02") {
+                            $courses = MCourse::whereMonth('created_at', $request->target_month)
+                            ->whereYear('created_at', $now)
+                            ->find($listResult[$keys[$i]][$j]["details"][$k]["menu_id"]);
+                            if ($courses) {
+                                $total_new_contract_course += ($courses->price / $courses->count) * count($listResult[$keys[$i]][$j]["t_contract_detail"]);
+                                if (!in_array($listResult[$keys[$i]][$j]["customer_id"], $customer_new_contract_course)) {
+                                    array_push($customer_new_contract_course, $listResult[$keys[$i]][$j]["customer_id"]);
+                                }
+                            }
+                            $course_digestion = MCourse::find($listResult[$keys[$i]][$j]["details"][$k]["menu_id"]);
+                            if ($course_digestion) {
+                                $total_amount_course_digestion += count($listResult[$keys[$i]][$j]["t_contract_detail"]);
+                                if (!in_array($listResult[$keys[$i]][$j]["customer_id"], $customer_course_digestion)) {
+                                    array_push($customer_course_digestion, $listResult[$keys[$i]][$j]["customer_id"]);
+                                }
+                            }
+                        }
+                    } else {
+                        //only 03
+                        if ($listResult[$keys[$i]][$j]["details"][$k]["category_cd"] == "03") {
+                            $item_only += 1;
+                        }
+                    }
+                }
+
+                if (!in_array($listResult[$keys[$i]][$j]["customer_id"], $customer_new_skill)) {
+                    array_push($customer_new_skill, $listResult[$keys[$i]][$j]["customer_id"]);
+                }
+            }
+
+            $listResult[$keys[$i]]["customer_new_skill"] = count($customer_new_skill);
+            $listResult[$keys[$i]]["sum_discount"] = $sum_discount;
+            $listResult[$keys[$i]]["nomination_skill"] = $nomination_skill;
+            $listResult[$keys[$i]]["total_new_skill"] = $total_new_skill;
+            $listResult[$keys[$i]]["total_new_contract_course"] = $total_new_contract_course;
+            $listResult[$keys[$i]]["customer_new_contract_course"] = count($customer_new_contract_course);
+            $listResult[$keys[$i]]["total_amount_course_digestion"] = $total_amount_course_digestion;
+            $listResult[$keys[$i]]["customer_course_digestion"] = count($customer_course_digestion);
+            $listResult[$keys[$i]]["item_only"] = $item_only;
+        }
+
+        $listMonth = $this->createMonthOrDay($shop_id, $request, $time = Carbon::now());
+
+        for ($i=0;$i<count($keys);$i++) {
+            $listMonth[(int)$keys[$i]-1] = $listResult[$keys[$i]];
+        }
+        $resultView = $this->exportView($shop_id, $request);
+        if(!$resultView["last_year"]){
+            $resultView["last_year"]=[];
+        }
+        $resultViewLastYear = $resultView["last_year"];
+        $time_view = Carbon::parse(Carbon::now()->format('Y')."/".$request->target_month."/"."01");
+
+        return view('exports.SaleTrendByDay', [
+        "result"=>$resultView ,
+        "resultViewLastYear"=>$resultViewLastYear ,
+        "listMonth"=>$listMonth,
+        "year"=>Carbon::now()->format('Y'),
+        "month"=>$request->target_month,
+        "shop_name"=>MShop::find($shop_id)->name,
+        //期間
+        "time_view" => $time_view->startOfMonth()->format('Y/m/d') ."～". $time_view->endOfMonth()->format('Y/m/d')
+    ]);
+    }
+
+
+    public function export($shop_id, Request $request)
+    {
+        if ($request->target_type == 0) {
+            $ex = Excel::download(new SaleTrendExportByMonth($shop_id, $request), 'SaleTrend.xlsx');;
+        }
+        if ($request->target_type == 1) {
+            $ex = Excel::download(new SaleTrendExportByDay($shop_id, $request), 'SaleTrend.xlsx');
+        }
+        return $ex;
+    }
+}

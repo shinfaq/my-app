@@ -1,0 +1,71 @@
+models: tạo ra kiểu dữ liệu mới, ứng với response
+services: gọi models, hỗ trợ xử lý resquest
+component: xử lý logic
+	- định nghĩa Form
+	- tạo xự kiện
+html: truyền vào
+	-Form được định nghĩa ở component
+	-Sự kiện(function) được định nghĩa ở component
+_______________________________________________________
+Observable như một array
+	subscribe
+		next(Data)
+		error(e)
+		complete()
+VD:
+let myObservable = new Observable(observer => {
+  setTimeout(() => {
+    observer.next("got data!")
+    observer.complete()
+  }, 1000)
+})
+
+let myObserver = {
+  next(data) {
+    console.log(data)
+  },
+  error(e) {
+    console.log(e)
+  },
+  complete() {
+    console.log("request complete")
+  }
+}
+
+myObservable.subscribe(myObserver)
+// (1 second) got data!
+// (1 second) request complete
+_________________________________________________________________________________________________
+Promise giống như một single value
+	then(result)
+	catch(error)
+VD:
+let add = (a,b) => {
+  return new Promise((resovle, rject) => {
+    if(typeof a != 'number' || typeof b != 'number'){
+      return reject(new Error ('tham so phai co kieu number'))
+    }
+    return resovle(a + b);
+  })
+}
+
+add(4,5)
+.then((result)=> console.log(result))
+.catch((error)=> console.log(error));
+_________________________________________________________________________________________________
+asysnc-await đánh dấu 1 function cần dừng lại để Promise xử lý xong kết quả mới tiếp tục
+VD:
+let addPlus = async (a, b, h) => {
+    try {
+        let ab = await add(a, b);  // a + b = ab
+        let abh = await add(ab, h);  // ab + h = abh
+        return Promise.resolve(abh);
+    } catch (error) {
+        return Promise.reject(error);
+    }
+}
+
+addPlus (4, 5, 6)
+.then(res => console.log(res))
+.catch(err => console.log(err.toString()));
+
